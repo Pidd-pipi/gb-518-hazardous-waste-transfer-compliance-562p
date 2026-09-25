@@ -73,10 +73,22 @@ skip_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/
   -d "{\"status\":\"in_transit\",\"expectedVersion\":$manifest_version,\"reason\":\"skip must be rejected\"}")
 [ "$skip_status" = "422" ]
 
+# Submitting without loading weight / plate / escort must be rejected (422).
+missing_weighing_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$manifest_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d "{\"status\":\"submitted\",\"expectedVersion\":$manifest_version,\"reason\":\"weighing data missing must block\"}")
+[ "$missing_weighing_status" = "422" ]
+
+# A non-positive loading weight must be rejected as well.
+zero_weighing_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$manifest_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d "{\"status\":\"submitted\",\"expectedVersion\":$manifest_version,\"reason\":\"zero weight must block\",\"loadingKg\":0,\"vehiclePlate\":\"沪A·W2086\",\"escortName\":\"王押运\"}")
+[ "$zero_weighing_status" = "422" ]
+
 submitted=$(curl -fsS -X POST "$backend_url/api/manifests/$manifest_id/transition" \
   -H "Authorization: Bearer $operator_token" -H 'X-Request-ID: validation-manifest-submit' -H 'Content-Type: application/json' \
-  -d "{\"status\":\"submitted\",\"expectedVersion\":$manifest_version,\"reason\":\"generator and carrier evidence verified\"}")
-printf '%s' "$submitted" | jq -e '.data.status == "submitted" and .data.version == 2' >/dev/null
+  -d "{\"status\":\"submitted\",\"expectedVersion\":$manifest_version,\"reason\":\"generator and carrier evidence verified\",\"loadingKg\":681.2,\"vehiclePlate\":\"沪A·W2086\",\"escortName\":\"王押运\"}")
+printf '%s' "$submitted" | jq -e '.data.status == "submitted" and .data.version == 2 and .data.loadingKg == 681.2 and .data.vehiclePlate == "沪A·W2086" and .data.escortName == "王押运"' >/dev/null
 
 stale_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$manifest_id/transition" \
   -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
@@ -89,8 +101,50 @@ blocked=$(curl -fsS -X POST "$backend_url/api/manifests" -H "Authorization: Bear
 blocked_id=$(printf '%s' "$blocked" | jq -er '.data.id')
 blocked_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$blocked_id/transition" \
   -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
-  -d '{"status":"submitted","expectedVersion":1,"reason":"unverified carrier must block"}')
+  -d '{"status":"submitted","expectedVersion":1,"reason":"unverified carrier must block","loadingKg":100,"vehiclePlate":"沪A·X","escortName":"x"}')
 [ "$blocked_status" = "422" ]
+
+# Dispatch requires the loading registration; the validation manifest already has it.
+dispatched=$(curl -fsS -X POST "$backend_url/api/manifests/$manifest_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'X-Request-ID: validation-manifest-dispatch' -H 'Content-Type: application/json' \
+  -d '{"status":"in_transit","expectedVersion":2,"reason":"vehicle dispatched with escort"}')
+printf '%s' "$dispatched" | jq -e '.data.status == "in_transit" and .data.version == 3' >/dev/null
+
+# Signing before the arrival weight is registered must keep the manifest in transit.
+early_receive_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$manifest_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"status":"received","expectedVersion":3,"reason":"arrival weight missing must block"}')
+[ "$early_receive_status" = "422" ]
+
+# Register arrival weight within the 3% tolerance, then sign without a deviation reason.
+arrived=$(curl -fsS -X POST "$backend_url/api/manifests/$manifest_id/weighing" \
+  -H "Authorization: Bearer $operator_token" -H 'X-Request-ID: validation-manifest-arrival' -H 'Content-Type: application/json' \
+  -d '{"expectedVersion":3,"arrivalKg":682.0,"reason":"到厂地磅单 WB-518"}')
+printf '%s' "$arrived" | jq -e '.data.arrivalKg == 682.0 and .data.version == 4' >/dev/null
+received=$(curl -fsS -X POST "$backend_url/api/manifests/$manifest_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'X-Request-ID: validation-manifest-receive' -H 'Content-Type: application/json' \
+  -d '{"status":"received","expectedVersion":4,"reason":"weights within tolerance, signed"}')
+printf '%s' "$received" | jq -e '.data.status == "received" and .data.version == 5' >/dev/null
+
+# A second manifest exercises the over-3% rule: receipt without reason stays in transit,
+# then succeeds with a documented reason.
+deviation_code="TM-DEVIATION-$stamp"
+deviation_payload=$(printf '%s' "$manifest_payload" | jq --arg code "$deviation_code" '.code=$code | .quantityKg=500')
+deviation_created=$(curl -fsS -X POST "$backend_url/api/manifests" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$deviation_payload")
+deviation_id=$(printf '%s' "$deviation_created" | jq -er '.data.id')
+curl -fsS -X POST "$backend_url/api/manifests/$deviation_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"status":"submitted","expectedVersion":1,"reason":"deviation flow submitted","loadingKg":500,"vehiclePlate":"沪A·D001","escortName":"李押运"}' >/dev/null
+curl -fsS -X POST "$backend_url/api/manifests/$deviation_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"status":"in_transit","expectedVersion":2,"reason":"deviation flow dispatched"}' >/dev/null
+curl -fsS -X POST "$backend_url/api/manifests/$deviation_id/weighing" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"expectedVersion":3,"arrivalKg":480,"reason":"到厂地磅单 WB-519"}' >/dev/null
+deviation_missing_reason_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$backend_url/api/manifests/$deviation_id/transition" \
+  -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"status":"received","expectedVersion":4,"reason":"4 percent deviation needs a reason"}')
+[ "$deviation_missing_reason_status" = "422" ]
+deviation_received=$(curl -fsS -X POST "$backend_url/api/manifests/$deviation_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' \
+  -d '{"status":"received","expectedVersion":4,"reason":"deviation documented and signed","weightDeviationReason":"途中挥发损失约百分之四，已现场复核地磅单"}')
+printf '%s' "$deviation_received" | jq -e '.data.status == "received" and (.data.weightDeviationReason | length > 0)' >/dev/null
 
 check_code="CC-VALIDATE-$stamp"
 check_payload=$(jq -nc --arg code "$check_code" --arg manifest "$manifest_code" --arg now "$now" '{

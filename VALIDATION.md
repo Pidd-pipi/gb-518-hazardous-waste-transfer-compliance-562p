@@ -39,9 +39,12 @@ KEEP_RUNNING=1 ./scripts/validate.sh
 
 - viewer 能读取四类业务数据，写联单和读取审计均返回 403。
 - operator 创建关联 `WG-001`、`CP-002` 的联单成功，request ID 为 `validation-manifest-create`。
-- `draft → in_transit` 跳级返回 422；合法 `draft → submitted` 成功并写入 `validation-manifest-submit`。
+- `draft → in_transit` 跳级返回 422；未填装车重量/车牌/押运员或装车重量为 0 的提交返回 422。
+- 携带装车重量、车牌、押运员的合法 `draft → submitted` 成功并写入 `validation-manifest-submit`，称重字段随联单持久化。
 - 使用旧版本推进联单返回 409。
 - 关联尚未核准的 `CP-001` 时，联单提交返回 422。
+- 发运后未登记到厂重量的签收返回 422（保留在途）；登记到厂重量后偏差不超过 3% 的签收成功。
+- 第二张联单到厂偏差超过 3%：未填偏差原因的签收返回 422，填写原因后签收成功并持久化 `weightDeviationReason`。
 - operator 创建核验成功，但作出通过决定返回 403。
 - reviewer 执行 `pending → pass` 成功，决定依据持久化，request ID 为 `validation-reviewer-decision`。
 - 审计汇总包含至少 5 条写操作和至少 2 次状态迁移；自定义 request ID 可从审计列表检索。
@@ -54,7 +57,7 @@ KEEP_RUNNING=1 ./scripts/validate.sh
 |---|---|---|
 | `/generators` | 许可编号、有效期、废物类别、共享 `LicensePanel`、分支状态按钮 | 通过 |
 | `/carriers` | 许可证、有效期、车辆数、共享 `LicensePanel`、复核按钮 | 通过 |
-| `/manifests` | 产废/承运关联、废物重量、提交/发运/签收/驳回分支 | 通过 |
+| `/manifests` | 产废/承运关联、计划/装车/到厂重量与偏差列、待补录提示、补录装车/登记到厂按钮、提交/发运/签收/驳回分支 | 通过 |
 | `/checks` | 联单关联、决定依据、终态锁定、新增与状态确认弹窗 | 通过 |
 | `/audit` | actor、action、实体、前后状态和 request ID | 通过 |
 

@@ -29,6 +29,11 @@ export interface DomainRecord {
 	manifestCode?: string;
 	checklist?: string;
 	decisionBasis?: string;
+	loadingKg?: number | null;
+	vehiclePlate?: string;
+	escortName?: string;
+	arrivalKg?: number | null;
+	weightDeviationReason?: string;
   createdAt: string;
   updatedAt: string;
 }

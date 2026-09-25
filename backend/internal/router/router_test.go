@@ -70,9 +70,9 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 	})
 	assertStatus(t, response, http.StatusUnprocessableEntity)
 
-	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", manifest.ID), operator, "manifest-submit", map[string]any{
+	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", manifest.ID), operator, "manifest-submit", withLoadingWeighing(map[string]any{
 		"status": "submitted", "expectedVersion": manifest.Version, "reason": "linked permits checked",
-	})
+	}, 680.5))
 	assertStatus(t, response, http.StatusOK)
 	manifest = decodeRecord(t, body)
 	if manifest.Status != "submitted" || manifest.Version != 2 {
@@ -95,9 +95,9 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 	response, body = request(t, engine, http.MethodPost, "/api/manifests", operator, "manifest-create-rejected", manifestPayload("TM-ROUTER-003", "CP-002"))
 	assertStatus(t, response, http.StatusCreated)
 	rejected := decodeRecord(t, body)
-	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", rejected.ID), operator, "manifest-submit-rejected", map[string]any{
+	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", rejected.ID), operator, "manifest-submit-rejected", withLoadingWeighing(map[string]any{
 		"status": "submitted", "expectedVersion": rejected.Version, "reason": "linked permits checked",
-	})
+	}, 680.5))
 	assertStatus(t, response, http.StatusOK)
 	rejected = decodeRecord(t, body)
 	response, _ = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", rejected.ID), operator, "manifest-reject", map[string]any{
@@ -229,5 +229,171 @@ func checkPayload(code, manifest string) map[string]any {
 		"facility": "复核中心", "owner": "reviewer", "category": "联单复核", "riskLevel": "medium",
 		"metricValue": 92, "metricUnit": "score", "effectiveAt": time.Now().UTC().Format(time.RFC3339),
 		"evidence": "minio://evidence/tests/check.pdf", "relatedCode": manifest,
+	}
+}
+
+func withLoadingWeighing(payload map[string]any, loadingKg float64) map[string]any {
+	payload["loadingKg"] = loadingKg
+	payload["vehiclePlate"] = "沪A·TEST"
+	payload["escortName"] = "测试押运员"
+	return payload
+}
+
+type weighingRecord struct {
+	ID                 uint     `json:"id"`
+	Code               string   `json:"code"`
+	Status             string   `json:"status"`
+	Version            uint     `json:"version"`
+	QuantityKg         float64  `json:"quantityKg"`
+	LoadingKg          *float64 `json:"loadingKg"`
+	ArrivalKg          *float64 `json:"arrivalKg"`
+	VehiclePlate       string   `json:"vehiclePlate"`
+	EscortName         string   `json:"escortName"`
+	WeightDeviationRsn string   `json:"weightDeviationReason"`
+}
+
+func decodeWeighingRecord(t *testing.T, body []byte) weighingRecord {
+	t.Helper()
+	var envelope struct {
+		Data weighingRecord `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Data.ID == 0 {
+		t.Fatalf("decode weighing record: %v body=%s", err, string(body))
+	}
+	return envelope.Data
+}
+
+func TestManifestWeighingRegistrationAndDeviationRules(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := testConfig(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	db, _, err := database.Open(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	engine := router.New(cfg, db, nil, logger)
+	operator := login(t, engine, "operator")
+
+	transition := func(id uint, payload map[string]any, requestID string) (*http.Response, []byte) {
+		return request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", id), operator, requestID, payload)
+	}
+	weighing := func(id uint, payload map[string]any, requestID string) (*http.Response, []byte) {
+		return request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/weighing", id), operator, requestID, payload)
+	}
+
+	// Submitting without loading weight / plate / escort must be rejected.
+	response, body := request(t, engine, http.MethodPost, "/api/manifests", operator, "weigh-create-a", manifestPayload("TM-WEIGH-A", "CP-002"))
+	assertStatus(t, response, http.StatusCreated)
+	manifestA := decodeRecord(t, body)
+	response, _ = transition(manifestA.ID, map[string]any{
+		"status": "submitted", "expectedVersion": manifestA.Version, "reason": "missing weighing must block submit",
+	}, "weigh-submit-missing")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Zero / negative loading weight cannot be submitted either.
+	response, _ = transition(manifestA.ID, withLoadingWeighing(map[string]any{
+		"status": "submitted", "expectedVersion": manifestA.Version, "reason": "zero loading weight must block submit",
+	}, 0), "weigh-submit-zero")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Valid weighing registration is persisted together with the submission.
+	response, body = transition(manifestA.ID, withLoadingWeighing(map[string]any{
+		"status": "submitted", "expectedVersion": manifestA.Version, "reason": "loading weighing captured at submission",
+	}, 1000), "weigh-submit-ok")
+	assertStatus(t, response, http.StatusOK)
+	manifestAFull := decodeWeighingRecord(t, body)
+	if manifestAFull.LoadingKg == nil || *manifestAFull.LoadingKg != 1000 || manifestAFull.VehiclePlate != "沪A·TEST" || manifestAFull.EscortName != "测试押运员" {
+		t.Fatalf("loading weighing not persisted: %+v", manifestAFull)
+	}
+
+	// Registered loading readings are immutable.
+	response, _ = weighing(manifestA.ID, map[string]any{
+		"expectedVersion": manifestAFull.Version, "loadingKg": 1100, "vehiclePlate": "沪B·OTHER", "escortName": "另一人",
+		"reason": "loading weighing must not be overwritten",
+	}, "weigh-loading-rewrite")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	// Dispatch still requires the parties (and loading weighing already present).
+	response, body = transition(manifestA.ID, map[string]any{
+		"status": "in_transit", "expectedVersion": manifestAFull.Version, "reason": "vehicle departed for facility",
+	}, "weigh-dispatch")
+	assertStatus(t, response, http.StatusOK)
+	manifestAFull = decodeWeighingRecord(t, body)
+
+	// Signing without arrival weight keeps the manifest in transit.
+	response, _ = transition(manifestA.ID, map[string]any{
+		"status": "received", "expectedVersion": manifestAFull.Version, "reason": "arrival weight missing must block receipt",
+	}, "weigh-receive-no-arrival")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Arrival within 3% can be signed without a deviation reason.
+	response, body = weighing(manifestA.ID, map[string]any{
+		"expectedVersion": manifestAFull.Version, "arrivalKg": 1010,
+		"reason": "arrival scale reading at facility",
+	}, "weigh-arrival-within")
+	assertStatus(t, response, http.StatusOK)
+	manifestAFull = decodeWeighingRecord(t, body)
+	response, body = transition(manifestA.ID, map[string]any{
+		"status": "received", "expectedVersion": manifestAFull.Version, "reason": "weights within tolerance, signed",
+	}, "weigh-receive-within")
+	assertStatus(t, response, http.StatusOK)
+	if got := decodeWeighingRecord(t, body); got.Status != "received" {
+		t.Fatalf("manifest should be received: %+v", got)
+	}
+
+	// Deviation over 3% requires a reason; otherwise the manifest stays in transit.
+	response, body = request(t, engine, http.MethodPost, "/api/manifests", operator, "weigh-create-b", manifestPayload("TM-WEIGH-B", "CP-002"))
+	assertStatus(t, response, http.StatusCreated)
+	manifestB := decodeRecord(t, body)
+	response, body = transition(manifestB.ID, withLoadingWeighing(map[string]any{
+		"status": "submitted", "expectedVersion": manifestB.Version, "reason": "second manifest submitted with weighing",
+	}, 500), "weigh-b-submit")
+	assertStatus(t, response, http.StatusOK)
+	manifestBFull := decodeWeighingRecord(t, body)
+	response, body = transition(manifestB.ID, map[string]any{
+		"status": "in_transit", "expectedVersion": manifestBFull.Version, "reason": "second manifest dispatched",
+	}, "weigh-b-dispatch")
+	assertStatus(t, response, http.StatusOK)
+	manifestBFull = decodeWeighingRecord(t, body)
+	response, body = weighing(manifestB.ID, map[string]any{
+		"expectedVersion": manifestBFull.Version, "arrivalKg": 480, "reason": "4% loss at arrival",
+	}, "weigh-b-arrival")
+	assertStatus(t, response, http.StatusOK)
+	manifestBFull = decodeWeighingRecord(t, body)
+	response, _ = transition(manifestB.ID, map[string]any{
+		"status": "received", "expectedVersion": manifestBFull.Version, "reason": "missing deviation reason must block receipt",
+	}, "weigh-b-receive-no-reason")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	response, body = transition(manifestB.ID, map[string]any{
+		"status": "received", "expectedVersion": manifestBFull.Version, "reason": "deviation documented and signed",
+		"weightDeviationReason": "途中挥发损失约百分之四，已现场复核地磅单",
+	}, "weigh-b-receive-reason")
+	assertStatus(t, response, http.StatusOK)
+	manifestBFull = decodeWeighingRecord(t, body)
+	if manifestBFull.Status != "received" || manifestBFull.WeightDeviationRsn == "" {
+		t.Fatalf("deviation reason must be persisted at receipt: %+v", manifestBFull)
+	}
+
+	// Legacy-style record: loading weighing can be backfilled while still in draft;
+	// submission preserves the readings, and arrival weighing cannot precede dispatch.
+	response, body = request(t, engine, http.MethodPost, "/api/manifests", operator, "weigh-create-d", manifestPayload("TM-WEIGH-D", "CP-002"))
+	assertStatus(t, response, http.StatusCreated)
+	manifestD := decodeRecord(t, body)
+	response, _ = weighing(manifestD.ID, map[string]any{
+		"expectedVersion": manifestD.Version, "arrivalKg": 300, "reason": "arrival before dispatch must block",
+	}, "weigh-d-arrival-early")
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	response, body = weighing(manifestD.ID, map[string]any{
+		"expectedVersion": manifestD.Version, "loadingKg": 650, "vehiclePlate": "沪C·BACKFILL", "escortName": "补录押运",
+		"reason": "backfill loading weighing at draft",
+	}, "weigh-d-backfill")
+	assertStatus(t, response, http.StatusOK)
+	manifestDFull := decodeWeighingRecord(t, body)
+	response, body = transition(manifestD.ID, map[string]any{
+		"status": "submitted", "expectedVersion": manifestDFull.Version, "reason": "submission keeps backfilled readings",
+	}, "weigh-d-submit")
+	assertStatus(t, response, http.StatusOK)
+	manifestDFull = decodeWeighingRecord(t, body)
+	if manifestDFull.LoadingKg == nil || *manifestDFull.LoadingKg != 650 || manifestDFull.VehiclePlate != "沪C·BACKFILL" {
+		t.Fatalf("backfilled weighing must survive submission: %+v", manifestDFull)
 	}
 }

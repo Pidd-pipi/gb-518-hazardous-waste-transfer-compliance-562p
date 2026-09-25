@@ -17,7 +17,8 @@ type TransferManifestService interface {
 	Get(context.Context, uint) (model.TransferManifest, error)
 	Create(context.Context, dto.CreateTransferManifest, string, string) (model.TransferManifest, error)
 	Update(context.Context, uint, dto.UpdateTransferManifest, string, string) (model.TransferManifest, error)
-	Transition(context.Context, uint, dto.TransitionRequest, string, string) (model.TransferManifest, error)
+	Transition(context.Context, uint, dto.TransitionTransferManifest, string, string) (model.TransferManifest, error)
+	RegisterWeighing(context.Context, uint, dto.RegisterManifestWeighing, string, string) (model.TransferManifest, error)
 	Delete(context.Context, uint, string, string) error
 	StatusCounts(context.Context) (map[string]int64, error)
 }
@@ -110,7 +111,7 @@ func (s *transferManifestService) Update(ctx context.Context, id uint, input dto
 	return s.repository.Get(ctx, id)
 }
 
-func (s *transferManifestService) Transition(ctx context.Context, id uint, input dto.TransitionRequest, actor, requestID string) (model.TransferManifest, error) {
+func (s *transferManifestService) Transition(ctx context.Context, id uint, input dto.TransitionTransferManifest, actor, requestID string) (model.TransferManifest, error) {
 	current, err := s.repository.Get(ctx, id)
 	if err != nil {
 		return model.TransferManifest{}, err
@@ -124,12 +125,106 @@ func (s *transferManifestService) Transition(ctx context.Context, id uint, input
 			return model.TransferManifest{}, err
 		}
 	}
+
+	detail := input.Reason
+	switch target {
+	case "submitted":
+		// 提交联单必须同时完成装车称重登记；已登记过的旧联单保持原数据不变。
+		if !current.HasLoadingWeighing() {
+			if err := applyLoadingWeighing(&current, input.LoadingKg, input.VehiclePlate, input.EscortName); err != nil {
+				return model.TransferManifest{}, err
+			}
+			detail = fmt.Sprintf("%s | 装车称重 %.2fkg，车牌 %s，押运员 %s", detail, *current.LoadingKg, current.VehiclePlate, current.EscortName)
+		}
+	case "in_transit":
+		// 发运前置：旧联单允许先补录，发运时仍缺登记则保持在已提交状态。
+		if !current.HasLoadingWeighing() {
+			return model.TransferManifest{}, fmt.Errorf("%w: loading weight, vehicle plate and escort must be registered before dispatch", ErrInvalidInput)
+		}
+	case "received":
+		// 签收前置：必须已登记到厂重量；偏差超过 3% 时必须填写偏差原因，否则保留在途。
+		if !current.HasArrivalWeighing() {
+			return model.TransferManifest{}, fmt.Errorf("%w: arrival weight must be registered before signing receipt", ErrInvalidInput)
+		}
+		reason := strings.TrimSpace(input.WeightDeviationReason)
+		if current.WeightDeviationExceeded() {
+			if reason == "" {
+				return model.TransferManifest{}, fmt.Errorf("%w: arrival weight deviates more than %.0f%% from loading weight; deviation reason is required to sign", ErrInvalidInput, model.WeightDeviationLimit*100)
+			}
+			if current.WeightDeviationReason == "" {
+				current.WeightDeviationReason = reason
+			}
+			detail = fmt.Sprintf("%s | 到厂偏差原因：%s", detail, current.WeightDeviationReason)
+		}
+	}
+
 	before := current.Status
 	current.Status = target
 	current.Version = input.ExpectedVersion + 1
 	current.UpdatedAt = time.Now().UTC()
-	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, input.Reason)); err != nil {
+	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, detail)); err != nil {
 		return model.TransferManifest{}, fmt.Errorf("transition 转运清单: %w", err)
+	}
+	return s.repository.Get(ctx, id)
+}
+
+// RegisterWeighing persists 运输称重登记 without changing state. Loading
+// registration is allowed while draft or submitted (covering legacy records
+// that predate weighing); arrival registration is allowed in_transit after
+// dispatch. Registered readings cannot be overwritten.
+func (s *transferManifestService) RegisterWeighing(ctx context.Context, id uint, input dto.RegisterManifestWeighing, actor, requestID string) (model.TransferManifest, error) {
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return model.TransferManifest{}, err
+	}
+
+	registeringLoading := input.LoadingKg != 0 || strings.TrimSpace(input.VehiclePlate) != "" || strings.TrimSpace(input.EscortName) != ""
+	registeringArrival := input.ArrivalKg != 0
+	if !registeringLoading && !registeringArrival {
+		return model.TransferManifest{}, fmt.Errorf("%w: provide loading weight/plate/escort or arrival weight", ErrInvalidInput)
+	}
+	if registeringLoading && registeringArrival {
+		return model.TransferManifest{}, fmt.Errorf("%w: loading and arrival weighing must be registered separately", ErrInvalidInput)
+	}
+
+	detailParts := []string{strings.TrimSpace(input.Reason)}
+	if registeringLoading {
+		switch current.Status {
+		case "draft", "submitted":
+		default:
+			return model.TransferManifest{}, fmt.Errorf("%w: loading weighing can only be registered before dispatch", ErrInvalidInput)
+		}
+		if current.HasLoadingWeighing() {
+			return model.TransferManifest{}, fmt.Errorf("%w: loading weighing is already registered and cannot be changed", ErrInvalidInput)
+		}
+		if err := applyLoadingWeighing(&current, input.LoadingKg, input.VehiclePlate, input.EscortName); err != nil {
+			return model.TransferManifest{}, err
+		}
+		detailParts = append(detailParts, fmt.Sprintf("补录装车称重 %.2fkg，车牌 %s，押运员 %s", *current.LoadingKg, current.VehiclePlate, current.EscortName))
+	}
+	if registeringArrival {
+		if current.Status != "in_transit" {
+			return model.TransferManifest{}, fmt.Errorf("%w: arrival weight can only be registered after dispatch", ErrInvalidInput)
+		}
+		if !current.HasLoadingWeighing() {
+			return model.TransferManifest{}, fmt.Errorf("%w: backfill loading weighing before registering arrival weight", ErrInvalidInput)
+		}
+		if current.HasArrivalWeighing() {
+			return model.TransferManifest{}, fmt.Errorf("%w: arrival weight is already registered and cannot be changed", ErrInvalidInput)
+		}
+		if input.ArrivalKg <= 0 {
+			return model.TransferManifest{}, fmt.Errorf("%w: arrival weight must be greater than zero", ErrInvalidInput)
+		}
+		arrival := input.ArrivalKg
+		current.ArrivalKg = &arrival
+		ratio, _ := current.WeightDeviationRatio()
+		detailParts = append(detailParts, fmt.Sprintf("登记到厂称重 %.2fkg，偏差 %.2f%%", arrival, ratio*100))
+	}
+
+	current.Version = input.ExpectedVersion + 1
+	current.UpdatedAt = time.Now().UTC()
+	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "weighing", "TransferManifest", current.Status, current.Status, strings.Join(detailParts, " | "))); err != nil {
+		return model.TransferManifest{}, fmt.Errorf("register weighing 转运清单: %w", err)
 	}
 	return s.repository.Get(ctx, id)
 }
@@ -164,6 +259,20 @@ func (s *transferManifestService) validateLinkedParties(ctx context.Context, man
 	if carrier.Status != "verified" || !carrier.LicenseExpiresAt.After(time.Now().UTC()) {
 		return fmt.Errorf("%w: carrier license must be verified and unexpired", ErrInvalidInput)
 	}
+	return nil
+}
+
+// applyLoadingWeighing validates and writes the dispatch-time registration.
+func applyLoadingWeighing(manifest *model.TransferManifest, loadingKg float64, vehiclePlate, escortName string) error {
+	plate := strings.TrimSpace(vehiclePlate)
+	escort := strings.TrimSpace(escortName)
+	if loadingKg <= 0 || plate == "" || escort == "" {
+		return fmt.Errorf("%w: positive loading weight, vehicle plate and escort are required to submit the manifest", ErrInvalidInput)
+	}
+	loading := loadingKg
+	manifest.LoadingKg = &loading
+	manifest.VehiclePlate = strings.ToUpper(plate)
+	manifest.EscortName = escort
 	return nil
 }
 
