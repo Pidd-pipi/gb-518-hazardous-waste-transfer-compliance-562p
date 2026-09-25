@@ -72,6 +72,7 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 
 	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", manifest.ID), operator, "manifest-submit", map[string]any{
 		"status": "submitted", "expectedVersion": manifest.Version, "reason": "linked permits checked",
+		"loadWeightKg": 680.5, "vehiclePlate": "鲁B·W8001", "escortName": "测试押运员",
 	})
 	assertStatus(t, response, http.StatusOK)
 	manifest = decodeRecord(t, body)
@@ -97,6 +98,7 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 	rejected := decodeRecord(t, body)
 	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", rejected.ID), operator, "manifest-submit-rejected", map[string]any{
 		"status": "submitted", "expectedVersion": rejected.Version, "reason": "linked permits checked",
+		"loadWeightKg": 660, "vehiclePlate": "鲁B·W8003", "escortName": "测试押运员",
 	})
 	assertStatus(t, response, http.StatusOK)
 	rejected = decodeRecord(t, body)
@@ -138,6 +140,191 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Meta.Total < 5 {
 		t.Fatalf("expected audited mutations, got total=%d error=%v", envelope.Meta.Total, err)
 	}
+}
+
+type weighingRecord struct {
+	ID                    uint     `json:"id"`
+	Code                  string   `json:"code"`
+	Status                string   `json:"status"`
+	Version               uint     `json:"version"`
+	LoadWeightKg          *float64 `json:"loadWeightKg"`
+	ArrivalWeightKg       *float64 `json:"arrivalWeightKg"`
+	VehiclePlate          string   `json:"vehiclePlate"`
+	EscortName            string   `json:"escortName"`
+	WeightDeviationReason string   `json:"weightDeviationReason"`
+}
+
+func transitionManifest(t *testing.T, engine http.Handler, id uint, token, requestID string, payload map[string]any) (*http.Response, []byte) {
+	t.Helper()
+	return request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", id), token, requestID, payload)
+}
+
+func registerWeighing(t *testing.T, engine http.Handler, id uint, token, requestID string, payload map[string]any) (*http.Response, []byte) {
+	t.Helper()
+	return request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/weighing", id), token, requestID, payload)
+}
+
+func decodeWeighingRecord(t *testing.T, body []byte) weighingRecord {
+	t.Helper()
+	var envelope struct {
+		Data weighingRecord `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Data.ID == 0 {
+		t.Fatalf("decode weighing record: %v body=%s", err, string(body))
+	}
+	return envelope.Data
+}
+
+func TestTransportWeighingLedger(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := testConfig(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	db, _, err := database.Open(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	engine := router.New(cfg, db, nil, logger)
+	operator := login(t, engine, "operator")
+
+	createDraft := func(code string) weighingRecord {
+		response, body := request(t, engine, http.MethodPost, "/api/manifests", operator, "weighing-create-"+code, manifestPayload(code, "CP-002"))
+		assertStatus(t, response, http.StatusCreated)
+		return decodeWeighingRecord(t, body)
+	}
+
+	// Submission without weighing data is rejected.
+	withoutWeighing := createDraft("TM-WEIGH-NONE")
+	response, _ := transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-submit-missing", map[string]any{
+		"status": "submitted", "expectedVersion": withoutWeighing.Version, "reason": "weighing data is mandatory",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Non-positive loading weight is rejected.
+	response, _ = transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-submit-zero", map[string]any{
+		"status": "submitted", "expectedVersion": withoutWeighing.Version, "reason": "zero weight must be rejected",
+		"loadWeightKg": 0, "vehiclePlate": "鲁B·W8000", "escortName": "测试押运员",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	response, _ = transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-submit-escort", map[string]any{
+		"status": "submitted", "expectedVersion": withoutWeighing.Version, "reason": "escort must be provided",
+		"loadWeightKg": 700, "vehiclePlate": "鲁B·W8000",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Backfill loading data through the weighing endpoint, then submit.
+	response, body := registerWeighing(t, engine, withoutWeighing.ID, operator, "weighing-backfill-loading", map[string]any{
+		"expectedVersion": withoutWeighing.Version,
+		"loadWeightKg":    680.5, "vehiclePlate": "鲁B·W8001", "escortName": "测试押运员",
+	})
+	assertStatus(t, response, http.StatusOK)
+	withoutWeighing = decodeWeighingRecord(t, body)
+	if withoutWeighing.LoadWeightKg == nil || *withoutWeighing.LoadWeightKg != 680.5 {
+		t.Fatalf("loading weighing was not persisted: %+v", withoutWeighing)
+	}
+	response, body = transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-submit-backfilled", map[string]any{
+		"status": "submitted", "expectedVersion": withoutWeighing.Version, "reason": "weighing backfilled before submission",
+	})
+	assertStatus(t, response, http.StatusOK)
+	withoutWeighing = decodeWeighingRecord(t, body)
+
+	// Registered ledger values cannot be silently overwritten.
+	response, _ = transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-rewrite", map[string]any{
+		"status": "in_transit", "expectedVersion": withoutWeighing.Version, "reason": "rewrite must be rejected",
+		"loadWeightKg": 690, "vehiclePlate": "鲁B·W9999", "escortName": "另一押运员",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	response, body = transitionManifest(t, engine, withoutWeighing.ID, operator, "weighing-dispatch", map[string]any{
+		"status": "in_transit", "expectedVersion": withoutWeighing.Version, "reason": "vehicle left the loading site",
+	})
+	assertStatus(t, response, http.StatusOK)
+	inTransit := decodeWeighingRecord(t, body)
+
+	// Arrival weight can only be registered after dispatch.
+	earlyArrival := createDraft("TM-WEIGH-EARLY")
+	response, _ = registerWeighing(t, engine, earlyArrival.ID, operator, "weighing-arrival-too-early", map[string]any{
+		"expectedVersion": earlyArrival.Version, "arrivalWeightKg": 600,
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Sign-off without arrival weight keeps the manifest in transit.
+	response, _ = transitionManifest(t, engine, inTransit.ID, operator, "weighing-receive-missing", map[string]any{
+		"status": "received", "expectedVersion": inTransit.Version, "reason": "arrival weight missing",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Register the arrival weight while remaining in transit.
+	response, body = registerWeighing(t, engine, inTransit.ID, operator, "weighing-arrival-within", map[string]any{
+		"expectedVersion": inTransit.Version, "arrivalWeightKg": 700.9,
+	})
+	assertStatus(t, response, http.StatusOK)
+	inTransit = decodeWeighingRecord(t, body)
+	if inTransit.Status != "in_transit" || inTransit.ArrivalWeightKg == nil {
+		t.Fatalf("arrival registration must keep the manifest in transit: %+v", inTransit)
+	}
+
+	// A transition request never carries new arrival weighing data.
+	response, _ = transitionManifest(t, engine, inTransit.ID, operator, "weighing-receive-inline-arrival", map[string]any{
+		"status": "received", "expectedVersion": inTransit.Version, "reason": "inline arrival must be rejected",
+		"arrivalWeightKg": 700.9,
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Arrival weight cannot be registered before dispatch.
+	response, _ = registerWeighing(t, engine, earlyArrival.ID, operator, "weighing-arrival-before-dispatch", map[string]any{
+		"expectedVersion": earlyArrival.Version, "loadWeightKg": 600, "vehiclePlate": "鲁B·W8004", "escortName": "测试押运员",
+		"arrivalWeightKg": 600,
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+
+	// Within the 3% threshold, sign-off succeeds without a deviation reason.
+	response, body = transitionManifest(t, engine, inTransit.ID, operator, "weighing-receive-within", map[string]any{
+		"status": "received", "expectedVersion": inTransit.Version, "reason": "weights match within tolerance",
+	})
+	assertStatus(t, response, http.StatusOK)
+	received := decodeWeighingRecord(t, body)
+	if received.Status != "received" {
+		t.Fatalf("manifest was not received: %+v", received)
+	}
+
+	// Beyond the 3% threshold, sign-off requires a deviation reason.
+	deviated := createDraft("TM-WEIGH-DEV")
+	response, body = transitionManifest(t, engine, deviated.ID, operator, "weighing-submit-dev", map[string]any{
+		"status": "submitted", "expectedVersion": deviated.Version, "reason": "weighing complete",
+		"loadWeightKg": 1000, "vehiclePlate": "鲁B·W8002", "escortName": "测试押运员",
+	})
+	assertStatus(t, response, http.StatusOK)
+	deviated = decodeWeighingRecord(t, body)
+	response, body = transitionManifest(t, engine, deviated.ID, operator, "weighing-dispatch-dev", map[string]any{
+		"status": "in_transit", "expectedVersion": deviated.Version, "reason": "vehicle dispatched",
+	})
+	assertStatus(t, response, http.StatusOK)
+	deviated = decodeWeighingRecord(t, body)
+
+	// Exactly 3% is still tolerated; 31 kg on a 1000 kg load exceeds it.
+	response, body = registerWeighing(t, engine, deviated.ID, operator, "weighing-arrival-dev", map[string]any{
+		"expectedVersion": deviated.Version, "arrivalWeightKg": 1031,
+	})
+	assertStatus(t, response, http.StatusOK)
+	deviated = decodeWeighingRecord(t, body)
+	response, _ = transitionManifest(t, engine, deviated.ID, operator, "weighing-receive-no-reason", map[string]any{
+		"status": "received", "expectedVersion": deviated.Version, "reason": "deviation reason is required",
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	response, body = transitionManifest(t, engine, deviated.ID, operator, "weighing-receive-with-reason", map[string]any{
+		"status": "received", "expectedVersion": deviated.Version, "reason": "deviation explained and accepted",
+		"weightDeviationReason": "途中遗撒已清理，差额与现场清扫记录一致",
+	})
+	assertStatus(t, response, http.StatusOK)
+	deviated = decodeWeighingRecord(t, body)
+	if deviated.Status != "received" || deviated.WeightDeviationReason == "" {
+		t.Fatalf("deviation reason was not persisted: %+v", deviated)
+	}
+
+	// No further weighing registration is allowed after sign-off.
+	response, _ = registerWeighing(t, engine, deviated.ID, operator, "weighing-after-received", map[string]any{
+		"expectedVersion": deviated.Version, "arrivalWeightKg": 1031,
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
 }
 
 func testConfig(t *testing.T) config.Config {

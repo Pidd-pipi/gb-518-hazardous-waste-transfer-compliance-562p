@@ -29,8 +29,27 @@ export interface DomainRecord {
 	manifestCode?: string;
 	checklist?: string;
 	decisionBasis?: string;
+  loadWeightKg?: number | null;
+  arrivalWeightKg?: number | null;
+  vehiclePlate?: string;
+  escortName?: string;
+  weightDeviationReason?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ManifestWeighingInput {
+  expectedVersion: number;
+  loadWeightKg?: number | null;
+  vehiclePlate?: string;
+  escortName?: string;
+  arrivalWeightKg?: number | null;
+  weightDeviationReason?: string;
+}
+
+export interface ManifestTransitionInput extends ManifestWeighingInput {
+  status: string;
+  reason: string;
 }
 
 export interface PageMeta { page: number; pageSize: number; total: number }

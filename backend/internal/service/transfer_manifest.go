@@ -17,7 +17,8 @@ type TransferManifestService interface {
 	Get(context.Context, uint) (model.TransferManifest, error)
 	Create(context.Context, dto.CreateTransferManifest, string, string) (model.TransferManifest, error)
 	Update(context.Context, uint, dto.UpdateTransferManifest, string, string) (model.TransferManifest, error)
-	Transition(context.Context, uint, dto.TransitionRequest, string, string) (model.TransferManifest, error)
+	Transition(context.Context, uint, dto.ManifestTransitionRequest, string, string) (model.TransferManifest, error)
+	RegisterWeighing(context.Context, uint, dto.RegisterWeighingRequest, string, string) (model.TransferManifest, error)
 	Delete(context.Context, uint, string, string) error
 	StatusCounts(context.Context) (map[string]int64, error)
 }
@@ -110,7 +111,7 @@ func (s *transferManifestService) Update(ctx context.Context, id uint, input dto
 	return s.repository.Get(ctx, id)
 }
 
-func (s *transferManifestService) Transition(ctx context.Context, id uint, input dto.TransitionRequest, actor, requestID string) (model.TransferManifest, error) {
+func (s *transferManifestService) Transition(ctx context.Context, id uint, input dto.ManifestTransitionRequest, actor, requestID string) (model.TransferManifest, error) {
 	current, err := s.repository.Get(ctx, id)
 	if err != nil {
 		return model.TransferManifest{}, err
@@ -119,8 +120,39 @@ func (s *transferManifestService) Transition(ctx context.Context, id uint, input
 	if !constants.CanTransition(constants.TransferManifestTransitions, current.Status, target) {
 		return model.TransferManifest{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current.Status, target)
 	}
+	// Arrival weighing belongs to the in-transit phase only and must be recorded
+	// through RegisterWeighing so the manifest stays in transit until it is done;
+	// a transition request never carries a new arrival weight.
+	if input.ArrivalWeightKg != nil {
+		return model.TransferManifest{}, fmt.Errorf("%w: register arrival weight while in transit before sign-off", ErrInvalidInput)
+	}
+	loadingSupplied := input.LoadWeightKg != nil || strings.TrimSpace(input.VehiclePlate) != "" || strings.TrimSpace(input.EscortName) != ""
+	if loadingSupplied && target != "submitted" && target != "in_transit" {
+		return model.TransferManifest{}, fmt.Errorf("%w: loading weighing can only be recorded at submission or dispatch", ErrInvalidInput)
+	}
+	if target != "received" && strings.TrimSpace(input.WeightDeviationReason) != "" {
+		return model.TransferManifest{}, fmt.Errorf("%w: deviation reason only applies to sign-off", ErrInvalidInput)
+	}
 	if target == "submitted" || target == "in_transit" {
 		if err := s.validateLinkedParties(ctx, current); err != nil {
+			return model.TransferManifest{}, err
+		}
+	}
+	if err := applyWeighingInput(&current, input.LoadWeightKg, input.VehiclePlate, input.EscortName, nil, input.WeightDeviationReason); err != nil {
+		return model.TransferManifest{}, err
+	}
+	if target == "submitted" {
+		if err := requireLoadingWeighing(current); err != nil {
+			return model.TransferManifest{}, err
+		}
+	}
+	if target == "in_transit" {
+		if err := requireLoadingWeighing(current); err != nil {
+			return model.TransferManifest{}, err
+		}
+	}
+	if target == "received" {
+		if err := requireArrivalWeighing(current, strings.TrimSpace(input.WeightDeviationReason)); err != nil {
 			return model.TransferManifest{}, err
 		}
 	}
@@ -130,6 +162,35 @@ func (s *transferManifestService) Transition(ctx context.Context, id uint, input
 	current.UpdatedAt = time.Now().UTC()
 	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, input.Reason)); err != nil {
 		return model.TransferManifest{}, fmt.Errorf("transition 转运清单: %w", err)
+	}
+	return s.repository.Get(ctx, id)
+}
+
+func (s *transferManifestService) RegisterWeighing(ctx context.Context, id uint, input dto.RegisterWeighingRequest, actor, requestID string) (model.TransferManifest, error) {
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return model.TransferManifest{}, err
+	}
+	switch current.Status {
+	case "draft", "submitted", "in_transit":
+	default:
+		return model.TransferManifest{}, fmt.Errorf("%w: weighing can only be registered before sign-off", ErrInvalidInput)
+	}
+	if input.LoadWeightKg == nil && input.ArrivalWeightKg == nil &&
+		strings.TrimSpace(input.VehiclePlate) == "" && strings.TrimSpace(input.EscortName) == "" {
+		return model.TransferManifest{}, fmt.Errorf("%w: at least one weighing field is required", ErrInvalidInput)
+	}
+	if input.ArrivalWeightKg != nil && current.Status != "in_transit" {
+		return model.TransferManifest{}, fmt.Errorf("%w: arrival weight can only be registered after dispatch", ErrInvalidInput)
+	}
+	if err := applyWeighingInput(&current, input.LoadWeightKg, input.VehiclePlate, input.EscortName, input.ArrivalWeightKg, input.WeightDeviationReason); err != nil {
+		return model.TransferManifest{}, err
+	}
+	current.Version = input.ExpectedVersion + 1
+	current.UpdatedAt = time.Now().UTC()
+	detail := "registered transport weighing data"
+	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "weighing", "TransferManifest", current.Status, current.Status, detail)); err != nil {
+		return model.TransferManifest{}, fmt.Errorf("register weighing 转运清单: %w", err)
 	}
 	return s.repository.Get(ctx, id)
 }
@@ -175,4 +236,98 @@ func validateTransferManifestBusinessFields(code, name, facility, owner, generat
 		return fmt.Errorf("%w: positive waste quantity and manifest evidence are required", ErrInvalidInput)
 	}
 	return nil
+}
+
+// applyWeighingInput merges one weighing submission into the manifest. Recorded
+// weighing data is an immutable ledger: a previously registered value can only
+// be re-submitted with the same value, never silently overwritten.
+func applyWeighingInput(manifest *model.TransferManifest, loadWeightKg *float64, vehiclePlate, escortName string, arrivalWeightKg *float64, deviationReason string) error {
+	plate := strings.TrimSpace(vehiclePlate)
+	escort := strings.TrimSpace(escortName)
+	reason := strings.TrimSpace(deviationReason)
+
+	if loadWeightKg != nil {
+		if *loadWeightKg <= 0 {
+			return fmt.Errorf("%w: loading weight must be greater than zero", ErrInvalidInput)
+		}
+		if manifest.LoadWeightKg != nil && *manifest.LoadWeightKg != *loadWeightKg {
+			return fmt.Errorf("%w: loading weight is already registered and cannot be changed", ErrInvalidInput)
+		}
+		if plate == "" {
+			plate = strings.TrimSpace(manifest.VehiclePlate)
+		}
+		if escort == "" {
+			escort = strings.TrimSpace(manifest.EscortName)
+		}
+		if plate == "" || escort == "" {
+			return fmt.Errorf("%w: loading weight, vehicle plate and escort are all required at submission", ErrInvalidInput)
+		}
+		manifest.LoadWeightKg = loadWeightKg
+	}
+	if plate != "" {
+		if manifest.VehiclePlate != "" && strings.TrimSpace(manifest.VehiclePlate) != plate {
+			return fmt.Errorf("%w: vehicle plate is already registered and cannot be changed", ErrInvalidInput)
+		}
+		manifest.VehiclePlate = plate
+	}
+	if escort != "" {
+		if manifest.EscortName != "" && strings.TrimSpace(manifest.EscortName) != escort {
+			return fmt.Errorf("%w: escort is already registered and cannot be changed", ErrInvalidInput)
+		}
+		manifest.EscortName = escort
+	}
+	if arrivalWeightKg != nil {
+		if *arrivalWeightKg <= 0 {
+			return fmt.Errorf("%w: arrival weight must be greater than zero", ErrInvalidInput)
+		}
+		if manifest.LoadWeightKg == nil {
+			return fmt.Errorf("%w: complete loading weighing before registering arrival weight", ErrInvalidInput)
+		}
+		if manifest.ArrivalWeightKg != nil && *manifest.ArrivalWeightKg != *arrivalWeightKg {
+			return fmt.Errorf("%w: arrival weight is already registered and cannot be changed", ErrInvalidInput)
+		}
+		manifest.ArrivalWeightKg = arrivalWeightKg
+	}
+	if reason != "" {
+		if manifest.ArrivalWeightKg == nil {
+			return fmt.Errorf("%w: deviation reason requires a registered arrival weight", ErrInvalidInput)
+		}
+		if manifest.WeightDeviationReason != "" && strings.TrimSpace(manifest.WeightDeviationReason) != reason {
+			return fmt.Errorf("%w: deviation reason is already recorded and cannot be changed", ErrInvalidInput)
+		}
+		manifest.WeightDeviationReason = reason
+	}
+	return nil
+}
+
+func requireLoadingWeighing(manifest model.TransferManifest) error {
+	if manifest.LoadWeightKg == nil || *manifest.LoadWeightKg <= 0 {
+		return fmt.Errorf("%w: register actual loading weight before submitting the manifest", ErrInvalidInput)
+	}
+	if strings.TrimSpace(manifest.VehiclePlate) == "" || strings.TrimSpace(manifest.EscortName) == "" {
+		return fmt.Errorf("%w: vehicle plate and escort must be filled before submission", ErrInvalidInput)
+	}
+	return nil
+}
+
+func requireArrivalWeighing(manifest model.TransferManifest, reason string) error {
+	if err := requireLoadingWeighing(manifest); err != nil {
+		return err
+	}
+	if manifest.ArrivalWeightKg == nil || *manifest.ArrivalWeightKg <= 0 {
+		return fmt.Errorf("%w: register arrival weight before sign-off; the manifest stays in transit", ErrInvalidInput)
+	}
+	deviation := manifest.WeightDeviationPct()
+	if mathAbs(*deviation) > model.WeightDeviationThresholdPct &&
+		reason == "" && strings.TrimSpace(manifest.WeightDeviationReason) == "" {
+		return fmt.Errorf("%w: arrival weight differs from loading weight by more than %.0f%%; a deviation reason is required before sign-off", ErrInvalidInput, model.WeightDeviationThresholdPct)
+	}
+	return nil
+}
+
+func mathAbs(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }

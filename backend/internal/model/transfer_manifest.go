@@ -21,6 +21,30 @@ type TransferManifest struct {
 	EffectiveAt   time.Time `json:"effectiveAt"`
 	Evidence      string    `json:"evidence" gorm:"size:2000"`
 	RelatedCode   string    `json:"relatedCode" gorm:"size:64;index"`
+
+	// Transport weighing ledger. QuantityKg stays the planned weight captured at
+	// manifest creation; the fields below are recorded at loading and again on
+	// arrival. Pointer types keep legacy rows distinguishable: nil serializes as
+	// null and the UI renders them as 待补录 instead of a misleading zero weight.
+	LoadWeightKg          *float64 `json:"loadWeightKg"`
+	ArrivalWeightKg       *float64 `json:"arrivalWeightKg"`
+	VehiclePlate          string   `json:"vehiclePlate" gorm:"size:32"`
+	EscortName            string   `json:"escortName" gorm:"size:80"`
+	WeightDeviationReason string   `json:"weightDeviationReason" gorm:"size:500"`
+}
+
+// WeightDeviationThresholdPct is the tolerated relative gap between the loading
+// and arrival weights. Beyond it, a received manifest must carry a reason.
+const WeightDeviationThresholdPct = 3.0
+
+// WeightDeviationPct returns (arrival - load) / load * 100 when both weights
+// exist, otherwise nil.
+func (item *TransferManifest) WeightDeviationPct() *float64 {
+	if item.LoadWeightKg == nil || item.ArrivalWeightKg == nil || *item.LoadWeightKg <= 0 {
+		return nil
+	}
+	deviation := (*item.ArrivalWeightKg - *item.LoadWeightKg) / *item.LoadWeightKg * 100
+	return &deviation
 }
 
 func (item *TransferManifest) GetBase() *BaseModel { return &item.BaseModel }

@@ -43,3 +43,30 @@ type UpdateTransferManifest struct {
 	Evidence        string    `json:"evidence" binding:"max=2000"`
 	RelatedCode     string    `json:"relatedCode" binding:"max=64"`
 }
+
+// ManifestTransitionRequest extends the generic transition contract with the
+// transport weighing ledger. Loading fields are mandatory for submission and
+// may be supplied to backfill legacy rows; arrival fields apply to sign-off.
+type ManifestTransitionRequest struct {
+	Status                string   `json:"status" binding:"required,max=40"`
+	ExpectedVersion       uint     `json:"expectedVersion" binding:"required"`
+	Reason                string   `json:"reason" binding:"required,min=3,max=500"`
+	LoadWeightKg          *float64 `json:"loadWeightKg"`
+	VehiclePlate          string   `json:"vehiclePlate" binding:"max=32"`
+	EscortName            string   `json:"escortName" binding:"max=80"`
+	ArrivalWeightKg       *float64 `json:"arrivalWeightKg"`
+	WeightDeviationReason string   `json:"weightDeviationReason" binding:"max=500"`
+}
+
+// RegisterWeighingRequest records a weighing without changing state. It is used
+// to register the arrival weight after dispatch (keeping the manifest in
+// transit) and to backfill weighing data on legacy rows before submission or
+// sign-off. Every supplied weight must be positive.
+type RegisterWeighingRequest struct {
+	ExpectedVersion       uint     `json:"expectedVersion" binding:"required"`
+	LoadWeightKg          *float64 `json:"loadWeightKg"`
+	VehiclePlate          string   `json:"vehiclePlate" binding:"max=32"`
+	EscortName            string   `json:"escortName" binding:"max=80"`
+	ArrivalWeightKg       *float64 `json:"arrivalWeightKg"`
+	WeightDeviationReason string   `json:"weightDeviationReason" binding:"max=500"`
+}

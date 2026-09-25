@@ -26,6 +26,7 @@ func (h *TransferManifestHandler) Register(group *gin.RouterGroup) {
 	resource.POST("", middleware.RequireMinimumRole(model.RoleOperator), h.create)
 	resource.PUT("/:id", middleware.RequireMinimumRole(model.RoleOperator), h.update)
 	resource.POST("/:id/transition", middleware.RequireMinimumRole(model.RoleOperator), h.transition)
+	resource.POST("/:id/weighing", middleware.RequireMinimumRole(model.RoleOperator), h.registerWeighing)
 	resource.DELETE("/:id", middleware.RequireRoles(model.RoleAdmin), h.remove)
 }
 
@@ -89,12 +90,30 @@ func (h *TransferManifestHandler) transition(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var input dto.TransitionRequest
+	var input dto.ManifestTransitionRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
 		util.Fail(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	item, err := h.service.Transition(c.Request.Context(), id, input, actorFromContext(c), requestIDFromContext(c))
+	if err != nil {
+		handleError(c, err)
+		return
+	}
+	util.OK(c, item)
+}
+
+func (h *TransferManifestHandler) registerWeighing(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	var input dto.RegisterWeighingRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		util.Fail(c, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	item, err := h.service.RegisterWeighing(c.Request.Context(), id, input, actorFromContext(c), requestIDFromContext(c))
 	if err != nil {
 		handleError(c, err)
 		return
